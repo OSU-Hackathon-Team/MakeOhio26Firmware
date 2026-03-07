@@ -61,6 +61,9 @@ def main():
     print(f"Opening {args.port} at {args.baud} baud …")
     try:
         ser = serial.Serial(args.port, args.baud, timeout=1)
+        ser.reset_input_buffer()
+        time.sleep(0.1)
+        ser.reset_input_buffer()
     except serial.SerialException as e:
         sys.exit(f"Cannot open serial port: {e}")
 

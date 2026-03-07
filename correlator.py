@@ -9,7 +9,7 @@ sensor over the last WINDOW samples.
 Usage:
     python correlator.py [PORT] [--baud BAUD] [--interval SECS] [--window N]
 
-    PORT defaults to /dev/ttyUSB0
+    PORT defaults to /dev/ttyUSB1
 """
 
 import argparse
@@ -27,8 +27,8 @@ SENSORS     = ("L", "1", "2")
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("port",     nargs="?", default="/dev/ttyUSB0",
-                   help="Serial port (default: /dev/ttyUSB0)")
+    p.add_argument("port",     nargs="?", default="/dev/ttyUSB1",
+                   help="Serial port (default: /dev/ttyUSB1)")
     p.add_argument("--baud",   type=int,  default=115200)
     p.add_argument("--interval", type=float, default=10.0,
                    help="Seconds between summary prints (default: 10)")
@@ -114,6 +114,9 @@ def main():
     print(f"Opening {args.port} at {args.baud} baud …")
     try:
         ser = serial.Serial(args.port, args.baud, timeout=1)
+        ser.reset_input_buffer()   # discard stale bytes buffered before we opened
+        time.sleep(0.1)            # let any in-flight bytes arrive
+        ser.reset_input_buffer()   # flush again to catch bytes that arrived during open
     except serial.SerialException as e:
         sys.exit(f"Cannot open serial port: {e}")
 

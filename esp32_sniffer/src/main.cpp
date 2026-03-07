@@ -22,10 +22,22 @@
 
 #define HUB_CHANNEL        6          // channel ESP12F hub listens on
 #ifndef HOP_INTERVAL_MS
-#define HOP_INTERVAL_MS    200UL      // dwell time per channel while hopping
+#define HOP_INTERVAL_MS    50UL       // dwell time per channel while hopping
 #endif
 #ifndef REPORT_INTERVAL_MS
 #define REPORT_INTERVAL_MS 30000UL    // 30 seconds
+#endif
+// Weighted hop sequence: ch 1, 6, 11 appear multiple times so the most-used
+// non-overlapping 2.4 GHz channels get proportionally more coverage.
+// 18 steps × 50 ms = 900 ms full cycle.
+// ch1 ×2, ch6 ×3, ch11 ×4 — all others ×1.
+static const uint8_t HOP_SEQ[]  = {1, 2, 6, 3, 4, 11, 5, 6, 7, 11, 8, 9, 6, 10, 11, 12, 13, 1};
+#define HOP_SEQ_LEN (sizeof(HOP_SEQ) / sizeof(HOP_SEQ[0]))
+// How many times to repeat the full injection burst so the hub lands on
+// HUB_CHANNEL at least once.  Hub cycle = 900 ms; ch6 appears 3/18 of steps.
+// 8 retries × ~250 ms each ≈ 2 s = ~2.2 hub cycles → very high hit probability.
+#ifndef REPORT_RETRIES
+#define REPORT_RETRIES     8
 #endif
 #define MAX_ENTRIES        100
 #define RECS_PER_FRAME     10         // 82 bytes payload / 8 bytes per entry
@@ -42,7 +54,8 @@ static PktEntry          g_buf[MAX_ENTRIES];
 static volatile uint16_t g_count = 0;
 static uint8_t           g_my_mac[6];
 static portMUX_TYPE      g_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint8_t           g_hop_ch = 1;   // current hopping channel
+static uint8_t           g_hop_idx = 0;                  // index into HOP_SEQ
+static uint8_t           g_hop_ch  = HOP_SEQ[0];         // current channel
 
 // ─────────────────────── buffer helpers ──────────────────────
 static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
@@ -148,24 +161,27 @@ static void send_report() {
     memcpy(s_frame_buf, PROBE_HDR, 24);
     memcpy(s_frame_buf + 10, g_my_mac, 6);   // fill Addr2
 
-    for (int off = 0; off < count; off += RECS_PER_FRAME) {
-        int batch = count - off;
-        if (batch > RECS_PER_FRAME) batch = RECS_PER_FRAME;
+    // Retry the full burst REPORT_RETRIES times so the hub (which is also
+    // hopping channels) is on HUB_CHANNEL for at least one transmission.
+    for (int retry = 0; retry < REPORT_RETRIES; retry++) {
+        for (int off = 0; off < count; off += RECS_PER_FRAME) {
+            int batch = count - off;
+            if (batch > RECS_PER_FRAME) batch = RECS_PER_FRAME;
 
-        uint8_t *p     = s_frame_buf + 24;
-        p[0] = 0xDE; p[1] = 0xAD; p[2] = 0xBE; p[3] = 0xEF;
-        p[4] = (uint8_t)DEVICE_ID;
-        p[5] = (uint8_t)batch;
-        memcpy(p + 6, &snap[off], batch * sizeof(PktEntry));
+            uint8_t *p     = s_frame_buf + 24;
+            p[0] = 0xDE; p[1] = 0xAD; p[2] = 0xBE; p[3] = 0xEF;
+            p[4] = (uint8_t)DEVICE_ID;
+            p[5] = (uint8_t)batch;
+            memcpy(p + 6, &snap[off], batch * sizeof(PktEntry));
 
-        int frame_len = 24 + 6 + batch * (int)sizeof(PktEntry);
-        // en_sys_seq=true: let the driver manage sequence numbers (required
-        // after manual channel changes; false breaks injection with err 258)
-        esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, s_frame_buf, frame_len, true);
-        if (err != ESP_OK)
-            Serial.printf("[ESP32-%d] tx err %d\n", DEVICE_ID, err);
+            int frame_len = 24 + 6 + batch * (int)sizeof(PktEntry);
+            esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, s_frame_buf, frame_len, true);
+            if (err != ESP_OK)
+                Serial.printf("[ESP32-%d] tx err %d\n", DEVICE_ID, err);
 
-        delay(25);  // small gap between back-to-back frames
+            delay(25);  // small gap between back-to-back frames
+        }
+        delay(25);  // brief gap between retries (no need to pad to 200ms with 50ms dwell)
     }
 
     // Resume hopping from the channel we were on before the report
@@ -211,10 +227,11 @@ void loop() {
     static uint32_t last_hop    = 0;
     uint32_t now = millis();
 
-    // Channel hop
+    // Channel hop through weighted sequence
     if (now - last_hop >= HOP_INTERVAL_MS) {
         last_hop = now;
-        g_hop_ch = (g_hop_ch % 13) + 1;   // cycle 1 → 2 → … → 13 → 1
+        g_hop_idx = (g_hop_idx + 1) % HOP_SEQ_LEN;
+        g_hop_ch  = HOP_SEQ[g_hop_idx];
         esp_wifi_set_channel(g_hop_ch, WIFI_SECOND_CHAN_NONE);
     }
 

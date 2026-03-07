@@ -21,8 +21,17 @@ extern "C" {
 #include <string.h>
 
 // ─────────────────────── configuration ───────────────────────
-#define SNIFF_CHANNEL       6
-#define REPORT_INTERVAL_MS  120000UL   // 2 minutes
+#define HUB_CHANNEL         6          // channel ESP32 injects on
+#define HOP_INTERVAL_MS     50UL       // dwell per channel while hopping
+// Local flush interval — should match ESP32 REPORT_INTERVAL_MS so both
+// sides emit data in the same cadence and the correlator sees overlap.
+#ifndef REPORT_INTERVAL_MS
+#define REPORT_INTERVAL_MS  30000UL    // 30 seconds (dev); 120000UL for production
+#endif
+// Weighted hop sequence matching esp32_sniffer — same pattern on both sensors
+// ensures symmetric coverage.  18 steps × 50 ms = 900 ms full cycle.
+static const uint8_t HOP_SEQ[]  = {1, 2, 6, 3, 4, 11, 5, 6, 7, 11, 8, 9, 6, 10, 11, 12, 13, 1};
+#define HOP_SEQ_LEN (sizeof(HOP_SEQ) / sizeof(HOP_SEQ[0]))
 #define MAX_ENTRIES         200
 
 // ─────────────────────── shared data structure ───────────────
@@ -38,9 +47,15 @@ static PktEntry          g_local[MAX_ENTRIES];
 static uint16_t          g_local_count = 0;
 static volatile bool     g_snapping    = false;   // main loop is reading
 
+// ─────────────────────── channel hopping state ───────────────
+static uint8_t g_hop_idx = 0;
+static uint8_t g_hop_ch  = HOP_SEQ[0];
+
 // ─────────────────────── remote (ESP32) receive queue ────────
 // Filled in the ISR; drained by loop() to avoid serial TX overflow.
-#define MAX_REMOTE 110   // enough for one full 100-entry report + headroom
+// Allow up to 200 entries: ESP32 retries injection up to 15× per report,
+// but we flush in loop() fast enough that this is just safety headroom.
+#define MAX_REMOTE 200
 struct RemoteEntry {
     uint8_t mac[6];
     int8_t  rssi;
@@ -148,7 +163,8 @@ static void flush_remote() {
                       r.mac[0], r.mac[1], r.mac[2],
                       r.mac[3], r.mac[4], r.mac[5],
                       (int)r.rssi, (unsigned)r.channel);
-        yield();   // let UART drain between lines
+        Serial.flush();   // block until TX buffer drains before next line
+        yield();          // feed the watchdog on long flushes
     }
     g_remote_count = 0;
 }
@@ -179,26 +195,42 @@ static void flush_local() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.printf("\nDBG,ESP12F hub starting ch=%d interval=%lus\n",
-                  SNIFF_CHANNEL, REPORT_INTERVAL_MS / 1000);
+    Serial.printf("\nDBG,ESP12F hub starting hop=1..13 interval=%lus\n",
+                  REPORT_INTERVAL_MS / 1000);
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
-    wifi_set_channel(SNIFF_CHANNEL);
+    g_hop_idx = 0;
+    g_hop_ch  = HOP_SEQ[0];
+    wifi_set_channel(g_hop_ch);
     wifi_set_promiscuous_rx_cb(sniffer_cb);  // set callback BEFORE enabling
     wifi_promiscuous_enable(1);
 
-    Serial.println("DBG,ESP12F sniffing");
+    Serial.printf("DBG,ESP12F sniffing ch=%d..%d hop=%lums interval=%lus\n",
+                  1, 13, HOP_INTERVAL_MS, REPORT_INTERVAL_MS / 1000);
 }
 
 void loop() {
     static uint32_t last_flush = 0;
+    static uint32_t last_hop   = 0;
+    uint32_t now = millis();
 
     flush_remote();   // drain any queued ESP32 entries first
 
-    if (millis() - last_flush >= REPORT_INTERVAL_MS) {
-        last_flush = millis();
+    // Channel hop through weighted sequence — disable promiscuous around
+    // wifi_set_channel() to avoid ESP8266 exceptions during channel changes.
+    if (now - last_hop >= HOP_INTERVAL_MS) {
+        last_hop = now;
+        g_hop_idx = (g_hop_idx + 1) % HOP_SEQ_LEN;
+        g_hop_ch  = HOP_SEQ[g_hop_idx];
+        wifi_promiscuous_enable(0);
+        wifi_set_channel(g_hop_ch);
+        wifi_promiscuous_enable(1);
+    }
+
+    if (now - last_flush >= REPORT_INTERVAL_MS) {
+        last_flush = now;
         flush_local();
     }
     delay(10);
