@@ -1,0 +1,5 @@
+*.a
+esp32_sniffer/.pio/
+.venv
+*.o
+__pycache__
