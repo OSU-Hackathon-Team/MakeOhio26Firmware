@@ -38,6 +38,18 @@ static PktEntry          g_local[MAX_ENTRIES];
 static uint16_t          g_local_count = 0;
 static volatile bool     g_snapping    = false;   // main loop is reading
 
+// ─────────────────────── remote (ESP32) receive queue ────────
+// Filled in the ISR; drained by loop() to avoid serial TX overflow.
+#define MAX_REMOTE 110   // enough for one full 100-entry report + headroom
+struct RemoteEntry {
+    uint8_t mac[6];
+    int8_t  rssi;
+    uint8_t channel;
+    uint8_t devid;
+};
+static RemoteEntry       g_remote[MAX_REMOTE];
+static volatile uint8_t  g_remote_count = 0;
+
 // ─────────────────────── record a local capture ──────────────
 static void record_local(const uint8_t *mac, int8_t rssi, uint8_t ch) {
     if (g_snapping) return;
@@ -100,14 +112,18 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
             // Sanity: max 10 records fit within 82 bytes (8 bytes each)
             if (count > 10) count = 10;
 
+            // Queue entries for loop() to print — avoids serial TX overflow
+            // from printing 100 lines back-to-back in ISR context.
             PktEntry entry;
             for (uint8_t i = 0; i < count; i++) {
+                if (g_remote_count >= MAX_REMOTE) break;
                 memcpy(&entry, frame + 30 + i * sizeof(PktEntry), sizeof(PktEntry));
-                Serial.printf("PKT,%u,%02X%02X%02X%02X%02X%02X,%d,%u\n",
-                              devid,
-                              entry.mac[0], entry.mac[1], entry.mac[2],
-                              entry.mac[3], entry.mac[4], entry.mac[5],
-                              (int)entry.rssi, (unsigned)entry.channel);
+                RemoteEntry &r = g_remote[g_remote_count];
+                memcpy(r.mac, entry.mac, 6);
+                r.rssi    = entry.rssi;
+                r.channel = entry.channel;
+                r.devid   = devid;
+                g_remote_count++;
             }
             return;
         }
@@ -121,7 +137,23 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
     }
 }
 
-// ─────────────────────── flush local buffer ──────────────────
+// ─────────────────────── flush remote queue ──────────────────
+static void flush_remote() {
+    uint8_t count = g_remote_count;
+    if (count == 0) return;
+    for (uint8_t i = 0; i < count; i++) {
+        RemoteEntry &r = g_remote[i];
+        Serial.printf("PKT,%u,%02X%02X%02X%02X%02X%02X,%d,%u\n",
+                      r.devid,
+                      r.mac[0], r.mac[1], r.mac[2],
+                      r.mac[3], r.mac[4], r.mac[5],
+                      (int)r.rssi, (unsigned)r.channel);
+        yield();   // let UART drain between lines
+    }
+    g_remote_count = 0;
+}
+
+
 static void flush_local() {
     g_snapping = true;
     uint16_t count = g_local_count;
@@ -162,6 +194,9 @@ void setup() {
 
 void loop() {
     static uint32_t last_flush = 0;
+
+    flush_remote();   // drain any queued ESP32 entries first
+
     if (millis() - last_flush >= REPORT_INTERVAL_MS) {
         last_flush = millis();
         flush_local();
