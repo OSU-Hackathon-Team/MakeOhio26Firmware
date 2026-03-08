@@ -28,7 +28,7 @@
 #define HOP_INTERVAL_MS    50UL       // dwell time per channel while hopping
 #endif
 #ifndef REPORT_INTERVAL_MS
-#define REPORT_INTERVAL_MS 30000UL    // 30 seconds
+#define REPORT_INTERVAL_MS 10000UL    // 10 seconds
 #endif
 // Weighted hop sequence: ch 1, 6, 11 appear multiple times so the most-used
 // non-overlapping 2.4 GHz channels get proportionally more coverage.
@@ -40,9 +40,9 @@ static const uint8_t HOP_SEQ[]  = {1, 2, 6, 3, 4, 11, 5, 6, 7, 11, 8, 9, 6, 10, 
 // HUB_CHANNEL at least once.  Hub cycle = 900 ms; ch6 appears 3/18 of steps.
 // 8 retries × ~250 ms each ≈ 2 s = ~2.2 hub cycles → very high hit probability.
 #ifndef REPORT_RETRIES
-#define REPORT_RETRIES     8
+#define REPORT_RETRIES     4
 #endif
-#define MAX_ENTRIES        100
+#define MAX_ENTRIES        200
 // ESP8266 management-frame buffer = 128 bytes; 12 bytes RxCtrl → 116 usable.
 // 116 - 24 (802.11 hdr) - 10 (magic+devid+count+report_ms) = 82 bytes / 12 bytes per entry = 6 max.
 #define RECS_PER_FRAME     6
@@ -61,8 +61,8 @@ static volatile uint16_t g_count    = 0;
 static volatile uint16_t g_overflow = 0;   // entries evicted because buffer was full
 static uint8_t           g_my_mac[6];
 static portMUX_TYPE      g_mux = portMUX_INITIALIZER_UNLOCKED;
-static uint8_t           g_hop_idx = 0;                  // index into HOP_SEQ
-static uint8_t           g_hop_ch  = HOP_SEQ[0];         // current channel
+static uint8_t g_hop_idx = (DEVICE_ID - 1) * (HOP_SEQ_LEN / 3);  // stagger across sensors
+static uint8_t g_hop_ch  = HOP_SEQ[(DEVICE_ID - 1) * (HOP_SEQ_LEN / 3)];
 
 // ─────────────────────── buffer helpers ──────────────────────
 static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
@@ -113,12 +113,29 @@ static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
  *   [22-23] Sequence Control
  */
 static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (type == WIFI_PKT_MISC) return;
-
     const wifi_promiscuous_pkt_t *pkt =
         reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
     const uint8_t *frame = pkt->payload;
     int len = pkt->rx_ctrl.sig_len;
+    int8_t rssi = pkt->rx_ctrl.rssi;
+    uint8_t ch   = pkt->rx_ctrl.channel;
+
+    if (type == WIFI_PKT_CTRL) {
+        // Control frames: ACK(0xD4), CTS(0xC4) have only Addr1 (10 bytes min).
+        // RTS(0xB4), Block ACK(0x94) have Addr1+Addr2 (16+ bytes).
+        // Addr1 is the *receiver* — when the AP ACKs the phone's uplink,
+        // Addr1 == phone MAC.  Skip broadcast/multicast.
+        if (len < 10) return;
+        uint8_t fc0 = frame[0];
+        if (fc0 != 0xD4 && fc0 != 0xC4 && fc0 != 0xB4 && fc0 != 0x94) return;
+        const uint8_t *addr1 = frame + 4;
+        if (addr1[0] & 0x01) return;   // skip broadcast / multicast
+        if (memcmp(addr1, g_my_mac, 6) == 0) return;
+        record(addr1, rssi, ch);
+        return;
+    }
+
+    if (type == WIFI_PKT_MISC) return;
 
     if (len < 24) return;
 
@@ -127,10 +144,26 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         frame[24] == 0xDE && frame[25] == 0xAD &&
         frame[26] == 0xBE && frame[27] == 0xEF) return;
 
-    // Skip frames originating from our own MAC (Addr2)
-    if (memcmp(frame + 10, g_my_mac, 6) == 0) return;
+    // Determine the client MAC using 802.11 DS bits in FC byte 1:
+    //   FC[1] bit 0 = To DS   (STA→AP):  Addr2 = client MAC  ← already in [10-15]
+    //   FC[1] bit 1 = From DS (AP→STA):  Addr1 = client MAC  ← must use [4-9]
+    //   Both clear = IBSS: Addr2 is the sender, use as-is.
+    //   Both set   = WDS 4-addr: Addr3 (BSSID) and Addr4 are mesh APs; use Addr2.
+    uint8_t fc1 = frame[1];
+    bool to_ds   = fc1 & 0x01;
+    bool from_ds = fc1 & 0x02;
 
-    record(frame + 10, pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel);
+    const uint8_t *client_mac;
+    if (from_ds && !to_ds) {
+        // Downlink: AP→STA — phone MAC is in Addr1
+        client_mac = frame + 4;
+    } else {
+        // Uplink, IBSS, or WDS — sender is in Addr2
+        client_mac = frame + 10;
+    }
+
+    if (memcmp(client_mac, g_my_mac, 6) == 0) return;
+    record(client_mac, rssi, ch);
 }
 
 // ─────────────────────── raw frame injection ──────────────────
@@ -251,8 +284,8 @@ void setup() {
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(sniffer_cb);
 
-    // Start hopping from channel 1
-    g_hop_ch = 1;
+    // Start hopping from the phase-staggered channel for this device
+    g_hop_ch = HOP_SEQ[g_hop_idx];
     esp_wifi_set_channel(g_hop_ch, WIFI_SECOND_CHAN_NONE);
     Serial.printf("[ESP32-%d] sniffing all channels\n", DEVICE_ID);
 }
@@ -275,5 +308,4 @@ void loop() {
         last_report = now;
         send_report();
     }
-    delay(10);
-}
+    delay(1);

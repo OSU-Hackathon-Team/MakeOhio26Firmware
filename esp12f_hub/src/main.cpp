@@ -26,13 +26,13 @@ extern "C" {
 // Local flush interval — should match ESP32 REPORT_INTERVAL_MS so both
 // sides emit data in the same cadence and the correlator sees overlap.
 #ifndef REPORT_INTERVAL_MS
-#define REPORT_INTERVAL_MS  30000UL    // 30 seconds (dev); 120000UL for production
+#define REPORT_INTERVAL_MS  10000UL    // 10 seconds (dev); 120000UL for production
 #endif
 // Weighted hop sequence matching esp32_sniffer — same pattern on both sensors
 // ensures symmetric coverage.  18 steps × 50 ms = 900 ms full cycle.
 static const uint8_t HOP_SEQ[]  = {1, 2, 6, 3, 4, 11, 5, 6, 7, 11, 8, 9, 6, 10, 11, 12, 13, 1};
 #define HOP_SEQ_LEN (sizeof(HOP_SEQ) / sizeof(HOP_SEQ[0]))
-#define MAX_ENTRIES         200
+#define MAX_ENTRIES         400
 
 // ─────────────────────── shared data structure ───────────────
 // Must be bit-for-bit identical to esp32_sniffer/src/main.cpp
@@ -50,8 +50,12 @@ static uint16_t          g_local_overflow = 0;    // entries evicted because buf
 static volatile bool     g_snapping       = false;   // main loop is reading
 
 // ─────────────────────── channel hopping state ───────────────
-static uint8_t g_hop_idx = 0;
-static uint8_t g_hop_ch  = HOP_SEQ[0];
+// Hub starts at offset 12 in the hop sequence (= 2/3 of 18 steps) so that
+// ESP32 #1 (offset 0), ESP32 #2 (offset 6), and the hub (offset 12) all
+// cover different channels simultaneously, tripling effective coverage.
+#define HUB_HOP_OFFSET 12
+static uint8_t g_hop_idx = HUB_HOP_OFFSET;
+static uint8_t g_hop_ch  = HOP_SEQ[HUB_HOP_OFFSET];
 
 // ─────────────────────── remote (ESP32) receive queue ────────
 // Filled in the ISR; drained by loop() to avoid serial TX overflow.
@@ -126,7 +130,7 @@ static void record_local(const uint8_t *mac, int8_t rssi, uint8_t ch) {
 
 // ─────────────────────── promiscuous callback ─────────────────
 void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
-    if (len < RXCTRL_SIZE + 24) return;    // need at least MAC header
+    if (len < RXCTRL_SIZE + 10) return;    // need at least Addr1 for control frames
 
     int8_t  rssi = static_cast<int8_t>(buf[0]);
     uint8_t ch   = buf[10] & 0x0F;
@@ -135,6 +139,7 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
 
     if (len == 128) {
         // ── Management frame (up to 112 bytes available) ──────────────────
+        if (len < RXCTRL_SIZE + 24) return;
         // Check for ESP32 report frame:
         //   FC[0]==0x40 (probe-request) and body bytes [24..27] == DE AD BE EF
         if (frame[0] == 0x40 && frame[1] == 0x00 &&
@@ -166,12 +171,37 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
             return;
         }
 
-        // Record locally by src MAC (Addr2) for cross-sensor correlation.
+        // Management frame: Addr2 is always the sender — record it.
         record_local(frame + 10, rssi, ch);
 
     } else {
-        // ── Data frame (first 36 bytes available) ─────────────────────────
-        record_local(frame + 10, rssi, ch);
+        // ── Data or Control frame (first 36 bytes available) ──────────────
+        // Only process 802.11 data frames (type bits [2:3] of FC[0] == 0b10).
+        // Ignore control frames (0b01) to avoid recording AP/broadcast MACs
+        // from short ACK/CTS frames whose Addr2 may be absent or garbage.
+        uint8_t fc_type = (frame[0] >> 2) & 0x03;
+        if (fc_type != 0x02) return;   // skip non-data frames (control = 0x01)
+
+        if (len < RXCTRL_SIZE + 24) return;
+
+        // Determine client MAC using DS bits in FC[1]:
+        //   bit 0 = To DS   (STA→AP): Addr2 = client
+        //   bit 1 = From DS (AP→STA): Addr1 = client (phone MAC in downlink)
+        bool to_ds   = frame[1] & 0x01;
+        bool from_ds = frame[1] & 0x02;
+
+        const uint8_t *client_mac;
+        if (from_ds && !to_ds) {
+            // Downlink (AP→phone): phone MAC is in Addr1
+            client_mac = frame + 4;
+        } else {
+            // Uplink (phone→AP), IBSS, or WDS: sender in Addr2
+            client_mac = frame + 10;
+        }
+
+        // Skip broadcast/multicast
+        if (client_mac[0] & 0x01) return;
+        record_local(client_mac, rssi, ch);
     }
 }
 
@@ -241,8 +271,7 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
 
-    g_hop_idx = 0;
-    g_hop_ch  = HOP_SEQ[0];
+    // g_hop_idx and g_hop_ch already initialized to HUB_HOP_OFFSET above
     wifi_set_channel(g_hop_ch);
     wifi_set_promiscuous_rx_cb(sniffer_cb);  // set callback BEFORE enabling
     wifi_promiscuous_enable(1);
@@ -273,5 +302,5 @@ void loop() {
         last_flush = now;
         flush_local();
     }
-    delay(10);
+    delay(1);
 }
