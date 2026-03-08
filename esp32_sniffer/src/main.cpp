@@ -11,6 +11,10 @@
  * actually sniffed, not just when the 30-second report was transmitted.
  *
  * Build with DEVICE_ID=1 for the first ESP32, DEVICE_ID=2 for the second.
+ *
+ * Debug option: define TARGET_MAC as a byte-array literal to lock onto the
+ * channel where that MAC is first seen instead of continuing to hop.
+ *   build_flags = -DTARGET_MAC="{0xAA,0xBB,0xCC,0xDD,0xEE,0xFF}"
  */
 
 #include <Arduino.h>
@@ -63,6 +67,14 @@ static uint8_t           g_my_mac[6];
 static portMUX_TYPE      g_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t g_hop_idx = (DEVICE_ID - 1) * (HOP_SEQ_LEN / 3);  // stagger across sensors
 static uint8_t g_hop_ch  = HOP_SEQ[(DEVICE_ID - 1) * (HOP_SEQ_LEN / 3)];
+
+#ifdef TARGET_MAC
+static const uint8_t    TARGET_MAC_BYTES[] = {TARGET_MAC_0, TARGET_MAC_1, TARGET_MAC_2,
+                                              TARGET_MAC_3, TARGET_MAC_4, TARGET_MAC_5};
+static volatile bool    g_target_locked    = false;
+static volatile uint8_t g_locked_ch        = 0;
+static bool             g_target_logged    = false;
+#endif
 
 // ─────────────────────── buffer helpers ──────────────────────
 static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
@@ -182,6 +194,13 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
 
     if (memcmp(client_mac, g_my_mac, 6) == 0) return;
+#ifdef TARGET_MAC
+    if (!g_target_locked && memcmp(client_mac, TARGET_MAC_BYTES, 6) == 0) {
+        g_target_locked = true;
+        g_locked_ch     = ch;
+    }
+    if (g_target_locked && memcmp(client_mac, TARGET_MAC_BYTES, 6) != 0) return;
+#endif
     record(client_mac, rssi, ch);
 }
 
@@ -308,6 +327,9 @@ void setup() {
     // Start hopping from the phase-staggered channel for this device
     g_hop_ch = HOP_SEQ[g_hop_idx];
     esp_wifi_set_channel(g_hop_ch, WIFI_SECOND_CHAN_NONE);
+#ifdef TARGET_MAC
+    Serial.printf("[ESP32-%d] TARGET_MAC mode — will lock channel on first sighting\n", DEVICE_ID);
+#endif
     Serial.printf("[ESP32-%d] sniffing all channels\n", DEVICE_ID);
 }
 
@@ -317,11 +339,25 @@ void loop() {
     uint32_t now = millis();
 
     // Channel hop through weighted sequence
+#ifdef TARGET_MAC
+    if (g_target_locked && !g_target_logged) {
+        g_target_logged = true;
+        g_hop_ch = g_locked_ch;
+        esp_wifi_set_channel(g_hop_ch, WIFI_SECOND_CHAN_NONE);
+        Serial.printf("[ESP32-%d] TARGET FOUND — locked to ch%d\n", DEVICE_ID, g_hop_ch);
+    }
+#endif
     if (now - last_hop >= HOP_INTERVAL_MS) {
         last_hop = now;
+#ifdef TARGET_MAC
+        if (!g_target_locked) {
+#endif
         g_hop_idx = (g_hop_idx + 1) % HOP_SEQ_LEN;
         g_hop_ch  = HOP_SEQ[g_hop_idx];
         esp_wifi_set_channel(g_hop_ch, WIFI_SECOND_CHAN_NONE);
+#ifdef TARGET_MAC
+        }
+#endif
     }
 
     // Periodic report (switches to HUB_CHANNEL internally, then restores g_hop_ch)

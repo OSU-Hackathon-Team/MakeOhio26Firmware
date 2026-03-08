@@ -1,0 +1,10 @@
+Connecting to Supabase at https://arlnwedyxtnyraqoaeql.supabase.co/...
+Opening /dev/ttyUSB1 at 115200 baud …
+Listening and bridging to Supabase. Press Ctrl-C to stop.
+
+  [???]  [ESP32-2] WARNING: 79 evictions (buffer full)
+  [???]  [ESP32-2] sending 200 entries
+  [???]  [ESP32-2] WARNING: 125 evictions (buffer full)
+  [???]  [ESP32-2] sending 200 entries
+
+Stopped.

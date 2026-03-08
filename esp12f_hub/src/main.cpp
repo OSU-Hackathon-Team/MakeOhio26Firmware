@@ -11,6 +11,10 @@
  *   PKT,<src>,<mac>,<rssi>,<channel>
  *   src = 'L' (local), '1' (ESP32 #1), '2' (ESP32 #2)
  *   mac = 12 hex chars, e.g. AABBCCDDEEFF
+ *
+ * Debug option: define TARGET_MAC as a byte-array literal to lock onto the
+ * channel where that MAC is first seen instead of continuing to hop.
+ *   build_flags = -DTARGET_MAC="{0xAA,0xBB,0xCC,0xDD,0xEE,0xFF}"
  */
 
 #include <Arduino.h>
@@ -56,6 +60,14 @@ static volatile bool     g_snapping       = false;   // main loop is reading
 #define HUB_HOP_OFFSET 12
 static uint8_t g_hop_idx = HUB_HOP_OFFSET;
 static uint8_t g_hop_ch  = HOP_SEQ[HUB_HOP_OFFSET];
+
+#ifdef TARGET_MAC
+static const uint8_t    TARGET_MAC_BYTES[] = {TARGET_MAC_0, TARGET_MAC_1, TARGET_MAC_2,
+                                              TARGET_MAC_3, TARGET_MAC_4, TARGET_MAC_5};
+static volatile bool    g_target_locked    = false;
+static volatile uint8_t g_locked_ch        = 0;
+static bool             g_target_logged    = false;
+#endif
 
 // ─────────────────────── remote (ESP32) receive queue ────────
 // Filled in the ISR; drained by loop() to avoid serial TX overflow.
@@ -207,6 +219,13 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
         }
 
         // Management frame: Addr2 is always the sender — record it.
+#ifdef TARGET_MAC
+        if (!g_target_locked && memcmp(frame + 10, TARGET_MAC_BYTES, 6) == 0) {
+            g_target_locked = true;
+            g_locked_ch     = ch;
+        }
+        if (g_target_locked && memcmp(frame + 10, TARGET_MAC_BYTES, 6) != 0) return;
+#endif
         record_local(frame + 10, rssi, ch);
 
     } else {
@@ -236,6 +255,13 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
 
         // Skip broadcast/multicast
         if (client_mac[0] & 0x01) return;
+#ifdef TARGET_MAC
+        if (!g_target_locked && memcmp(client_mac, TARGET_MAC_BYTES, 6) == 0) {
+            g_target_locked = true;
+            g_locked_ch     = ch;
+        }
+        if (g_target_locked && memcmp(client_mac, TARGET_MAC_BYTES, 6) != 0) return;
+#endif
         record_local(client_mac, rssi, ch);
     }
 }
@@ -353,6 +379,9 @@ void setup() {
 
     Serial.printf("DBG,ESP12F sniffing ch=%d..%d hop=%lums interval=%lus\n",
                   1, 13, HOP_INTERVAL_MS, REPORT_INTERVAL_MS / 1000);
+#ifdef TARGET_MAC
+    Serial.println("DBG,TARGET_MAC mode — will lock channel on first sighting");
+#endif
 }
 
 void loop() {
@@ -364,10 +393,32 @@ void loop() {
 
     // Channel hop through weighted sequence — disable promiscuous around
     // wifi_set_channel() to avoid ESP8266 exceptions during channel changes.
+#ifdef TARGET_MAC
+    if (g_target_locked && !g_target_logged) {
+        g_target_logged = true;
+        g_hop_ch = g_locked_ch;
+        wifi_promiscuous_enable(0);
+        wifi_set_channel(g_hop_ch);
+        wifi_promiscuous_enable(1);
+        Serial.printf("DBG,TARGET FOUND — alternating ch%d/ch%d (hub_ch)\n", g_hop_ch, HUB_CHANNEL);
+    }
+#endif
     if (now - last_hop >= HOP_INTERVAL_MS) {
         last_hop = now;
+#ifdef TARGET_MAC
+        if (g_target_locked) {
+            // Alternate every hop tick between the locked channel and HUB_CHANNEL
+            // so ESP32 reports are never missed.  50 ms on each gives more
+            // HUB_CHANNEL coverage than normal hopping (50 % vs ~17 %).
+            g_hop_ch = (g_hop_ch == g_locked_ch && g_locked_ch != HUB_CHANNEL)
+                       ? HUB_CHANNEL : g_locked_ch;
+        } else {
+#endif
         g_hop_idx = (g_hop_idx + 1) % HOP_SEQ_LEN;
         g_hop_ch  = HOP_SEQ[g_hop_idx];
+#ifdef TARGET_MAC
+        }
+#endif
         wifi_promiscuous_enable(0);
         wifi_set_channel(g_hop_ch);
         wifi_promiscuous_enable(1);
