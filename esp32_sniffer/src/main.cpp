@@ -70,6 +70,12 @@ static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
     portENTER_CRITICAL_ISR(&g_mux);
     for (int i = 0; i < g_count; i++) {
         if (memcmp(g_buf[i].mac, mac, 6) == 0) {
+            // All fields identical — complete duplicate, nothing to update
+            if (rssi == g_buf[i].rssi && ch == g_buf[i].channel &&
+                now_ms == g_buf[i].timestamp_ms) {
+                portEXIT_CRITICAL_ISR(&g_mux);
+                return;
+            }
             if (rssi > g_buf[i].rssi) {
                 g_buf[i].rssi         = rssi;
                 g_buf[i].channel      = ch;

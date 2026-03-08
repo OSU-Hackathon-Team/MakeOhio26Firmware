@@ -73,6 +73,25 @@ struct RemoteEntry {
 static RemoteEntry       g_remote[MAX_REMOTE];
 static volatile uint8_t  g_remote_count = 0;
 
+// ─────────────────────── persistent dedup store ──────────────
+// Tracks every entry printed by flush_remote() so that retries arriving after
+// the queue has already been flushed are still recognised as duplicates.
+// Keyed on all output fields (devid + mac + rssi + channel + timestamp_ms +
+// report_ms); evicted per-devid whenever a new report_ms is detected, which
+// happens at most once every REPORT_INTERVAL_MS.
+struct SeenKey {
+    uint8_t  mac[6];
+    uint8_t  devid;
+    int8_t   rssi;
+    uint8_t  channel;
+    uint32_t timestamp_ms;
+    uint32_t report_ms;
+};  // 18 bytes
+#define MAX_SEEN (MAX_ENTRIES * 2)   // headroom for up to 2 ESP32s
+static SeenKey   g_seen[MAX_SEEN];
+static uint16_t  g_seen_count = 0;
+static uint32_t  g_devid_report_ms[3] = {0, 0, 0};  // last report_ms seen per devid
+
 // ─────────────────────── record a local capture ──────────────
 static void record_local(const uint8_t *mac, int8_t rssi, uint8_t ch) {
     if (g_snapping) return;
@@ -155,10 +174,26 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
 
             // Queue entries for loop() to print — avoids serial TX overflow
             // from printing 100 lines back-to-back in ISR context.
+            // Dedup: skip entries where all fields (devid, mac, rssi, channel,
+            // timestamp_ms) are identical to an already-queued entry.  This
+            // prevents the same 200-entry report from being queued 4× when the
+            // ESP32 sends REPORT_RETRIES identical retries.
             PktEntry entry;
             for (uint8_t i = 0; i < count; i++) {
                 if (g_remote_count >= MAX_REMOTE) break;
                 memcpy(&entry, frame + 34 + i * sizeof(PktEntry), sizeof(PktEntry));
+                bool dup = false;
+                for (uint8_t k = 0; k < g_remote_count; k++) {
+                    if (g_remote[k].devid        == devid             &&
+                        g_remote[k].rssi         == entry.rssi        &&
+                        g_remote[k].channel      == entry.channel     &&
+                        g_remote[k].timestamp_ms == entry.timestamp_ms &&
+                        memcmp(g_remote[k].mac, entry.mac, 6) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
                 RemoteEntry &r = g_remote[g_remote_count];
                 memcpy(r.mac, entry.mac, 6);
                 r.rssi         = entry.rssi;
@@ -211,6 +246,35 @@ static void flush_remote() {
     if (count == 0) return;
     for (uint8_t i = 0; i < count; i++) {
         RemoteEntry &r = g_remote[i];
+        uint8_t didx = (r.devid <= 2) ? r.devid : 0;
+
+        // When a new report_ms is seen for this devid, the prior report cycle is
+        // over — evict its stale seen entries so the new report prints cleanly.
+        if (g_devid_report_ms[didx] != r.report_ms) {
+            g_devid_report_ms[didx] = r.report_ms;
+            uint16_t w = 0;
+            for (uint16_t k = 0; k < g_seen_count; k++)
+                if (g_seen[k].devid != r.devid)
+                    g_seen[w++] = g_seen[k];
+            g_seen_count = w;
+        }
+
+        // Skip if all fields were already printed in a previous flush cycle.
+        // This deduplcates retries that arrive after the queue has been cleared.
+        bool dup = false;
+        for (uint16_t k = 0; k < g_seen_count; k++) {
+            if (g_seen[k].devid        == r.devid        &&
+                g_seen[k].rssi         == r.rssi          &&
+                g_seen[k].channel      == r.channel       &&
+                g_seen[k].timestamp_ms == r.timestamp_ms  &&
+                g_seen[k].report_ms    == r.report_ms     &&
+                memcmp(g_seen[k].mac, r.mac, 6) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+
         Serial.printf("PKT,%u,%02X%02X%02X%02X%02X%02X,%d,%u,%lu,%lu\n",
                       r.devid,
                       r.mac[0], r.mac[1], r.mac[2],
@@ -220,6 +284,17 @@ static void flush_remote() {
                       (unsigned long)r.report_ms);
         Serial.flush();
         yield();
+
+        // Record as printed so subsequent retries are recognised as duplicates.
+        if (g_seen_count < MAX_SEEN) {
+            SeenKey &sk = g_seen[g_seen_count++];
+            memcpy(sk.mac, r.mac, 6);
+            sk.devid        = r.devid;
+            sk.rssi         = r.rssi;
+            sk.channel      = r.channel;
+            sk.timestamp_ms = r.timestamp_ms;
+            sk.report_ms    = r.report_ms;
+        }
     }
     // Compact any entries that arrived via ISR during the flush above.
     // Briefly disable promiscuous mode so the callback cannot write to the
