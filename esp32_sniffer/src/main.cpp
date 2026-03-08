@@ -124,14 +124,27 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
         // Control frames: ACK(0xD4), CTS(0xC4) have only Addr1 (10 bytes min).
         // RTS(0xB4), Block ACK(0x94) have Addr1+Addr2 (16+ bytes).
         // Addr1 is the *receiver* — when the AP ACKs the phone's uplink,
-        // Addr1 == phone MAC.  Skip broadcast/multicast.
+        // Addr1 == phone MAC.  Only UPDATE existing entries (don't add new ones)
+        // to avoid flooding the buffer with MAC addresses from every nearby device.
         if (len < 10) return;
         uint8_t fc0 = frame[0];
         if (fc0 != 0xD4 && fc0 != 0xC4 && fc0 != 0xB4 && fc0 != 0x94) return;
         const uint8_t *addr1 = frame + 4;
         if (addr1[0] & 0x01) return;   // skip broadcast / multicast
         if (memcmp(addr1, g_my_mac, 6) == 0) return;
-        record(addr1, rssi, ch);
+        // Update-only: refresh RSSI for known MACs, don't insert new ones
+        portENTER_CRITICAL_ISR(&g_mux);
+        for (int i = 0; i < (int)g_count; i++) {
+            if (memcmp(g_buf[i].mac, addr1, 6) == 0) {
+                if (rssi > g_buf[i].rssi) {
+                    g_buf[i].rssi         = rssi;
+                    g_buf[i].channel      = ch;
+                    g_buf[i].timestamp_ms = millis();
+                }
+                break;
+            }
+        }
+        portEXIT_CRITICAL_ISR(&g_mux);
         return;
     }
 
@@ -197,11 +210,13 @@ static const uint8_t PROBE_HDR[24] = {
 static uint8_t s_frame_buf[24 + 10 + RECS_PER_FRAME * sizeof(PktEntry)];
 
 static void send_report() {
-    // Atomically snapshot and clear the buffer
+    // Atomically snapshot and clear the buffer.
+    // snap[] is static to avoid a 2.4 KB stack allocation (200 × 12 bytes)
+    // that would overflow the main task stack.
+    static PktEntry snap[MAX_ENTRIES];
     portENTER_CRITICAL(&g_mux);
     uint16_t count    = g_count;
     uint16_t overflow = g_overflow;
-    PktEntry snap[MAX_ENTRIES];
     if (count > 0) memcpy(snap, g_buf, count * sizeof(PktEntry));
     g_count    = 0;
     g_overflow = 0;
@@ -309,3 +324,4 @@ void loop() {
         send_report();
     }
     delay(1);
+}

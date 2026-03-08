@@ -32,7 +32,7 @@ extern "C" {
 // ensures symmetric coverage.  18 steps × 50 ms = 900 ms full cycle.
 static const uint8_t HOP_SEQ[]  = {1, 2, 6, 3, 4, 11, 5, 6, 7, 11, 8, 9, 6, 10, 11, 12, 13, 1};
 #define HOP_SEQ_LEN (sizeof(HOP_SEQ) / sizeof(HOP_SEQ[0]))
-#define MAX_ENTRIES         400
+#define MAX_ENTRIES         200
 
 // ─────────────────────── shared data structure ───────────────
 // Must be bit-for-bit identical to esp32_sniffer/src/main.cpp
@@ -302,5 +302,5 @@ void loop() {
         last_flush = now;
         flush_local();
     }
-    delay(1);
+    delay(10);
 }
