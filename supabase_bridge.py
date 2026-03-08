@@ -42,14 +42,13 @@ def parse_args():
 def main():
     args = parse_args()
 
-    env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "MakeOhio26", ".env"))
-    load_dotenv(env_path)
+    load_dotenv()
 
     url = os.environ.get("VITE_SUPABASE_URL")
     key = os.environ.get("VITE_SUPABASE_ANON_KEY")
 
     if not url or not key:
-        print(f"Error: Supabase credentials not found at {env_path}")
+        print(f"Error: Supabase credentials not found")
         sys.exit(1)
 
     print(f"Connecting to Supabase at {url}...")
@@ -100,11 +99,10 @@ def main():
 
                     try:
                         payload = {
-                            "packet_id":      f"pkt_{mac}_{int(now)}",
-                            "board_id":       board_id,
-                            "mac_addr":       mac,
-                            "rssi":           int(rssi_s),
-                            "channel":        int(ch_s),
+                            "packet_id":       f"pkt_{mac}_{int(now)}",
+                            "board_id":        board_id,
+                            "device_hash":     mac,
+                            "rssi":            int(rssi_s),
                             "arrival_time_us": int(now * 1_000_000),
                         }
                         supabase.table("packet_reports").insert(payload).execute()
