@@ -57,7 +57,8 @@ struct __attribute__((packed)) PktEntry {
 };  // 12 bytes
 
 static PktEntry          g_buf[MAX_ENTRIES];
-static volatile uint16_t g_count = 0;
+static volatile uint16_t g_count    = 0;
+static volatile uint16_t g_overflow = 0;   // entries evicted because buffer was full
 static uint8_t           g_my_mac[6];
 static portMUX_TYPE      g_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t           g_hop_idx = 0;                  // index into HOP_SEQ
@@ -84,6 +85,19 @@ static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
         g_buf[g_count].channel      = ch;
         g_buf[g_count].timestamp_ms = now_ms;
         g_count++;
+    } else {
+        // Buffer full: evict the oldest entry so the most recent observations
+        // are always retained instead of silently dropping new arrivals.
+        int oldest = 0;
+        for (int i = 1; i < MAX_ENTRIES; i++) {
+            if ((int32_t)(g_buf[i].timestamp_ms - g_buf[oldest].timestamp_ms) < 0)
+                oldest = i;
+        }
+        memcpy(g_buf[oldest].mac, mac, 6);
+        g_buf[oldest].rssi         = rssi;
+        g_buf[oldest].channel      = ch;
+        g_buf[oldest].timestamp_ms = now_ms;
+        g_overflow++;
     }
     portEXIT_CRITICAL_ISR(&g_mux);
 }
@@ -152,16 +166,20 @@ static uint8_t s_frame_buf[24 + 10 + RECS_PER_FRAME * sizeof(PktEntry)];
 static void send_report() {
     // Atomically snapshot and clear the buffer
     portENTER_CRITICAL(&g_mux);
-    uint16_t count = g_count;
+    uint16_t count    = g_count;
+    uint16_t overflow = g_overflow;
     PktEntry snap[MAX_ENTRIES];
     if (count > 0) memcpy(snap, g_buf, count * sizeof(PktEntry));
-    g_count = 0;
+    g_count    = 0;
+    g_overflow = 0;
     portEXIT_CRITICAL(&g_mux);
 
     if (count == 0) {
         Serial.printf("[ESP32-%d] nothing to report\n", DEVICE_ID);
         return;
     }
+    if (overflow > 0)
+        Serial.printf("[ESP32-%d] WARNING: %u evictions (buffer full)\n", DEVICE_ID, overflow);
     Serial.printf("[ESP32-%d] sending %u entries\n", DEVICE_ID, count);
 
     // Disable promiscuous + switch to hub channel for clean TX
@@ -257,5 +275,5 @@ void loop() {
         last_report = now;
         send_report();
     }
-    delay(100);
+    delay(10);
 }

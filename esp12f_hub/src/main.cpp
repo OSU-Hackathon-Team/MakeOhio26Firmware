@@ -45,8 +45,9 @@ struct __attribute__((packed)) PktEntry {
 
 // ─────────────────────── local capture buffer ────────────────
 static PktEntry          g_local[MAX_ENTRIES];
-static uint16_t          g_local_count = 0;
-static volatile bool     g_snapping    = false;   // main loop is reading
+static uint16_t          g_local_count    = 0;
+static uint16_t          g_local_overflow = 0;    // entries evicted because buffer was full
+static volatile bool     g_snapping       = false;   // main loop is reading
 
 // ─────────────────────── channel hopping state ───────────────
 static uint8_t g_hop_idx = 0;
@@ -88,6 +89,18 @@ static void record_local(const uint8_t *mac, int8_t rssi, uint8_t ch) {
         g_local[g_local_count].channel      = ch;
         g_local[g_local_count].timestamp_ms = now_ms;
         g_local_count++;
+    } else {
+        // Buffer full: evict the oldest entry so recent observations are preserved.
+        int oldest = 0;
+        for (int i = 1; i < MAX_ENTRIES; i++) {
+            if ((int32_t)(g_local[i].timestamp_ms - g_local[oldest].timestamp_ms) < 0)
+                oldest = i;
+        }
+        memcpy(g_local[oldest].mac, mac, 6);
+        g_local[oldest].rssi         = rssi;
+        g_local[oldest].channel      = ch;
+        g_local[oldest].timestamp_ms = now_ms;
+        g_local_overflow++;
     }
 }
 
@@ -178,23 +191,35 @@ static void flush_remote() {
         Serial.flush();
         yield();
     }
-    g_remote_count = 0;
+    // Compact any entries that arrived via ISR during the flush above.
+    // Briefly disable promiscuous mode so the callback cannot write to the
+    // queue while we move and reset it.
+    wifi_promiscuous_enable(0);
+    uint8_t leftover = g_remote_count - count;
+    if (leftover > 0)
+        memmove(g_remote, g_remote + count, leftover * sizeof(RemoteEntry));
+    g_remote_count = leftover;
+    wifi_promiscuous_enable(1);
 }
 
 
 static void flush_local() {
     g_snapping = true;
-    uint16_t count = g_local_count;
+    uint16_t count    = g_local_count;
+    uint16_t overflow = g_local_overflow;
     PktEntry snap[MAX_ENTRIES];
     if (count > 0) memcpy(snap, g_local, count * sizeof(PktEntry));
     uint32_t report_ms = millis();   // anchor for epoch correction, same as ESP32 pattern
-    g_local_count = 0;
-    g_snapping    = false;
+    g_local_count    = 0;
+    g_local_overflow = 0;
+    g_snapping       = false;
 
     if (count == 0) {
         Serial.println("DBG,no local packets this interval");
         return;
     }
+    if (overflow > 0)
+        Serial.printf("DBG,WARNING: %u local evictions (buffer full)\n", overflow);
     Serial.printf("DBG,flushing %u local entries\n", count);
     for (uint16_t i = 0; i < count; i++) {
         Serial.printf("PKT,L,%02X%02X%02X%02X%02X%02X,%d,%u,%lu,%lu\n",
