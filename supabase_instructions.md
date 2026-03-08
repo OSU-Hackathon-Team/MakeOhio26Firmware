@@ -1,4 +1,37 @@
 Arduino to Supabase Integration Guide
+
+## packet_reports Table Schema
+
+Run this in the Supabase SQL Editor (https://supabase.com/dashboard → SQL Editor) to create or migrate the table:
+
+```sql
+-- Create table (if starting fresh)
+CREATE TABLE IF NOT EXISTS public.packet_reports (
+    id               bigserial PRIMARY KEY,
+    packet_id        text        NOT NULL,
+    board_id         text        NOT NULL,
+    device_hash      text        NOT NULL,
+    rssi             integer     NOT NULL,
+    arrival_time_us  bigint      NOT NULL,  -- corrected Unix epoch sniff time in µs
+    esp_timestamp_ms bigint,                -- board millis() when this MAC was sniffed
+    esp_report_ms    bigint,                -- board millis() at report transmit time (epoch anchor)
+    created_at       timestamptz DEFAULT now()
+);
+
+-- Migration: add new columns to an existing table
+ALTER TABLE public.packet_reports
+    ADD COLUMN IF NOT EXISTS esp_timestamp_ms bigint,
+    ADD COLUMN IF NOT EXISTS esp_report_ms    bigint;
+```
+
+### Epoch Correction
+`arrival_time_us` is already corrected to Unix epoch microseconds by `supabase_bridge.py`:
+```
+arrival_time_us = (python_rx_time - (esp_report_ms - esp_timestamp_ms) / 1000.0) × 1_000_000
+```
+`esp_timestamp_ms` and `esp_report_ms` are stored raw for debugging or re-computation.
+
+
 This guide explains how to send real-time sensor data from an Arduino/ESP32 to a Supabase database.
 
 1. Prerequisites

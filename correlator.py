@@ -10,6 +10,11 @@ Usage:
     python correlator.py [PORT] [--baud BAUD] [--interval SECS] [--window N]
 
     PORT defaults to /dev/ttyUSB1
+
+PKT line format:
+    PKT,<src>,<mac>,<rssi>,<channel>,<timestamp_ms>,<report_ms>
+    timestamp_ms = board millis() when the packet was sniffed
+    report_ms    = board millis() at transmit time (epoch correction anchor)
 """
 
 import argparse
@@ -42,21 +47,30 @@ def parse_args():
 #   "1":  deque([rssi, ...], maxlen=window),
 #   "2":  deque([rssi, ...], maxlen=window),
 #   "ch": last_seen_channel,
+#   "ts": last_seen_timestamp_ms (board millis()),
+#   "rx": python time.time() when the report containing this entry was received,
+#         used to reconstruct: sniff_unix ≈ rx - (report_ms - ts) / 1000
 # }
 packets:  dict = {}
 pkt_order: list = []
 _window = 10
 
-def ingest(src: str, mac: str, rssi: int, ch: int):
+def ingest(src: str, mac: str, rssi: int, ch: int, timestamp_ms: int, report_ms: int, rx_time: float):
     if mac not in packets:
         if len(packets) >= MAX_TRACKED:
             old = pkt_order.pop(0)
             packets.pop(old, None)
         packets[mac] = {s: deque(maxlen=_window) for s in SENSORS}
         packets[mac]["ch"] = ch
+        packets[mac]["ts"] = timestamp_ms
+        packets[mac]["rx"] = rx_time
+        packets[mac]["rm"] = report_ms
         pkt_order.append(mac)
     packets[mac][src].append(rssi)
     packets[mac]["ch"] = ch
+    packets[mac]["ts"] = timestamp_ms
+    packets[mac]["rx"] = rx_time
+    packets[mac]["rm"] = report_ms
 
 # ── display ───────────────────────────────────────────────────────────────────
 def sensor_count(d):
@@ -101,7 +115,12 @@ def print_summary():
     for mac, d in shared:
         fmt_mac = ':'.join(mac[i:i+2] for i in range(0, 12, 2))
         ch = d["ch"]
-        print(f"  {fmt_mac}  {fmt_rssi(d['L'])}  {fmt_rssi(d['1'])}  {fmt_rssi(d['2'])}  {ch:>2}")
+        rx = d.get("rx", 0.0)
+        rm = d.get("rm", 0)
+        ts = d.get("ts", 0)
+        sniff_unix = rx - (rm - ts) / 1000.0
+        sniff_str  = time.strftime("%H:%M:%S", time.localtime(sniff_unix)) + f".{int(sniff_unix * 1000) % 1000:03d}"
+        print(f"  {fmt_mac}  {fmt_rssi(d['L'])}  {fmt_rssi(d['1'])}  {fmt_rssi(d['2'])}  {ch:>2}  sniff={sniff_str}")
 
     print(f"{'━'*78}\n")
 
@@ -137,11 +156,12 @@ def main():
 
                 if line.startswith("PKT,"):
                     parts = line.split(",")
-                    if len(parts) == 5:
-                        _, src, mac, rssi_s, ch_s = parts
+                    if len(parts) == 7:
+                        _, src, mac, rssi_s, ch_s, ts_s, report_ms_s = parts
                         try:
                             ingest(src.strip(), mac.strip().upper(),
-                                   int(rssi_s), int(ch_s))
+                                   int(rssi_s), int(ch_s),
+                                   int(ts_s), int(report_ms_s), time.time())
                         except ValueError:
                             pass
                 elif line.startswith("DBG,"):

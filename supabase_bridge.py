@@ -6,9 +6,15 @@ Reads PKT lines from the ESP12F hub over serial and uploads them to Supabase
 to trigger real-time triangulation and occupancy tracking.
 
 PKT line format (matches correlator.py):
-    PKT,<src>,<mac>,<rssi>,<channel>
-    src = 'L' (ESP12F local), '1' (ESP32 #1), '2' (ESP32 #2)
-    mac = 12 hex chars, e.g. AABBCCDDEEFF
+    PKT,<src>,<mac>,<rssi>,<channel>,<timestamp_ms>,<report_ms>
+    src          = 'L' (ESP12F local), '1' (ESP32 #1), '2' (ESP32 #2)
+    mac          = 12 hex chars, e.g. AABBCCDDEEFF
+    timestamp_ms = board millis() when this MAC's best-RSSI packet was sniffed
+    report_ms    = board millis() at the moment the report was transmitted
+                   (same value for all entries in one burst)
+
+Epoch correction:
+    sniff_unix = python_rx_time - (report_ms - timestamp_ms) / 1000.0
 
 Usage:
     python supabase_bridge.py [PORT] [--baud BAUD] [--interval SECS]
@@ -35,8 +41,8 @@ def parse_args():
     p.add_argument("port", nargs="?", default="/dev/ttyUSB1",
                    help="Serial port (default: /dev/ttyUSB1)")
     p.add_argument("--baud", type=int, default=115200)
-    p.add_argument("--interval", type=float, default=1.0,
-                   help="Minimum seconds between uploads per MAC (rate limiting)")
+    p.add_argument("--interval", type=float, default=0.5,
+                   help="Minimum seconds between uploads per MAC (rate limiting, default: 0.5s = 2/sec)")
     return p.parse_args()
 
 def main():
@@ -83,8 +89,8 @@ def main():
 
             if line.startswith("PKT,"):
                 parts = line.split(",")
-                if len(parts) == 5:
-                    _, src, mac, rssi_s, ch_s = parts
+                if len(parts) == 7:
+                    _, src, mac, rssi_s, ch_s, ts_s, report_ms_s = parts
                     src = src.strip()
                     mac = mac.strip().upper()
 
@@ -98,15 +104,22 @@ def main():
                         continue
 
                     try:
+                        report_ms = int(report_ms_s)
+                        ts_ms     = int(ts_s)
+                        # Corrected sniff time: shift board uptime back to Unix epoch
+                        # using the report_ms anchor received at known wall-clock time.
+                        sniff_unix = now - (report_ms - ts_ms) / 1000.0
                         payload = {
-                            "packet_id":       f"pkt_{mac}_{int(now)}",
-                            "board_id":        board_id,
-                            "device_hash":     mac,
-                            "rssi":            int(rssi_s),
-                            "arrival_time_us": int(now * 1_000_000),
+                            "packet_id":        f"pkt_{mac}_{int(now)}",
+                            "board_id":         board_id,
+                            "device_hash":      mac,
+                            "rssi":             int(rssi_s),
+                            "arrival_time_us":  int(sniff_unix * 1_000_000),
+                            "esp_timestamp_ms": ts_ms,
+                            "esp_report_ms":    report_ms,
                         }
                         supabase.table("packet_reports").insert(payload).execute()
-                        print(f"  [SUPA] {mac} from {src} ({int(rssi_s):+d} dBm ch{ch_s})")
+                        print(f"  [SUPA] {mac} from {src} ({int(rssi_s):+d} dBm ch{ch_s} sniff={sniff_unix:.3f})")
                         last_upload[mac] = now
                     except ValueError:
                         pass

@@ -40,7 +40,8 @@ struct __attribute__((packed)) PktEntry {
     uint8_t  mac[6];
     int8_t   rssi;
     uint8_t  channel;
-};  // 8 bytes
+    uint32_t timestamp_ms;   // millis() on the originating ESP32 when sniffed
+};  // 12 bytes
 
 // ─────────────────────── local capture buffer ────────────────
 static PktEntry          g_local[MAX_ENTRIES];
@@ -57,10 +58,12 @@ static uint8_t g_hop_ch  = HOP_SEQ[0];
 // but we flush in loop() fast enough that this is just safety headroom.
 #define MAX_REMOTE 200
 struct RemoteEntry {
-    uint8_t mac[6];
-    int8_t  rssi;
-    uint8_t channel;
-    uint8_t devid;
+    uint8_t  mac[6];
+    int8_t   rssi;
+    uint8_t  channel;
+    uint8_t  devid;
+    uint32_t timestamp_ms;   // millis() on ESP32 when sniffed
+    uint32_t report_ms;      // millis() on ESP32 at start of send_report()
 };
 static RemoteEntry       g_remote[MAX_REMOTE];
 static volatile uint8_t  g_remote_count = 0;
@@ -68,19 +71,22 @@ static volatile uint8_t  g_remote_count = 0;
 // ─────────────────────── record a local capture ──────────────
 static void record_local(const uint8_t *mac, int8_t rssi, uint8_t ch) {
     if (g_snapping) return;
+    uint32_t now_ms = millis();
     for (int i = 0; i < g_local_count; i++) {
         if (memcmp(g_local[i].mac, mac, 6) == 0) {
             if (rssi > g_local[i].rssi) {
-                g_local[i].rssi    = rssi;
-                g_local[i].channel = ch;
+                g_local[i].rssi         = rssi;
+                g_local[i].channel      = ch;
+                g_local[i].timestamp_ms = now_ms;
             }
             return;
         }
     }
     if (g_local_count < MAX_ENTRIES) {
         memcpy(g_local[g_local_count].mac, mac, 6);
-        g_local[g_local_count].rssi    = rssi;
-        g_local[g_local_count].channel = ch;
+        g_local[g_local_count].rssi         = rssi;
+        g_local[g_local_count].channel      = ch;
+        g_local[g_local_count].timestamp_ms = now_ms;
         g_local_count++;
     }
 }
@@ -124,20 +130,24 @@ void IRAM_ATTR sniffer_cb(uint8_t *buf, uint16_t len) {
 
             uint8_t devid = frame[28];
             uint8_t count = frame[29];
-            // Sanity: max 10 records fit within 82 bytes (8 bytes each)
-            if (count > 10) count = 10;
+            uint32_t report_ms;
+            memcpy(&report_ms, frame + 30, 4);   // millis() on ESP32 at send_report()
+            // Sanity: max 6 records fit within the 82-byte body window
+            if (count > 6) count = 6;
 
             // Queue entries for loop() to print — avoids serial TX overflow
             // from printing 100 lines back-to-back in ISR context.
             PktEntry entry;
             for (uint8_t i = 0; i < count; i++) {
                 if (g_remote_count >= MAX_REMOTE) break;
-                memcpy(&entry, frame + 30 + i * sizeof(PktEntry), sizeof(PktEntry));
+                memcpy(&entry, frame + 34 + i * sizeof(PktEntry), sizeof(PktEntry));
                 RemoteEntry &r = g_remote[g_remote_count];
                 memcpy(r.mac, entry.mac, 6);
-                r.rssi    = entry.rssi;
-                r.channel = entry.channel;
-                r.devid   = devid;
+                r.rssi         = entry.rssi;
+                r.channel      = entry.channel;
+                r.devid        = devid;
+                r.timestamp_ms = entry.timestamp_ms;
+                r.report_ms    = report_ms;
                 g_remote_count++;
             }
             return;
@@ -158,13 +168,15 @@ static void flush_remote() {
     if (count == 0) return;
     for (uint8_t i = 0; i < count; i++) {
         RemoteEntry &r = g_remote[i];
-        Serial.printf("PKT,%u,%02X%02X%02X%02X%02X%02X,%d,%u\n",
+        Serial.printf("PKT,%u,%02X%02X%02X%02X%02X%02X,%d,%u,%lu,%lu\n",
                       r.devid,
                       r.mac[0], r.mac[1], r.mac[2],
                       r.mac[3], r.mac[4], r.mac[5],
-                      (int)r.rssi, (unsigned)r.channel);
-        Serial.flush();   // block until TX buffer drains before next line
-        yield();          // feed the watchdog on long flushes
+                      (int)r.rssi, (unsigned)r.channel,
+                      (unsigned long)r.timestamp_ms,
+                      (unsigned long)r.report_ms);
+        Serial.flush();
+        yield();
     }
     g_remote_count = 0;
 }
@@ -175,6 +187,7 @@ static void flush_local() {
     uint16_t count = g_local_count;
     PktEntry snap[MAX_ENTRIES];
     if (count > 0) memcpy(snap, g_local, count * sizeof(PktEntry));
+    uint32_t report_ms = millis();   // anchor for epoch correction, same as ESP32 pattern
     g_local_count = 0;
     g_snapping    = false;
 
@@ -184,10 +197,12 @@ static void flush_local() {
     }
     Serial.printf("DBG,flushing %u local entries\n", count);
     for (uint16_t i = 0; i < count; i++) {
-        Serial.printf("PKT,L,%02X%02X%02X%02X%02X%02X,%d,%u\n",
+        Serial.printf("PKT,L,%02X%02X%02X%02X%02X%02X,%d,%u,%lu,%lu\n",
                       snap[i].mac[0], snap[i].mac[1], snap[i].mac[2],
                       snap[i].mac[3], snap[i].mac[4], snap[i].mac[5],
-                      (int)snap[i].rssi, (unsigned)snap[i].channel);
+                      (int)snap[i].rssi, (unsigned)snap[i].channel,
+                      (unsigned long)snap[i].timestamp_ms,
+                      (unsigned long)report_ms);
     }
 }
 

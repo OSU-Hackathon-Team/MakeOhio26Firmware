@@ -7,6 +7,9 @@
  * probe-request frames whose body carries the collected entries, then resumes
  * hopping.  The ESP12F hub picks these up and forwards them to the laptop.
  *
+ * Records a millis() timestamp per entry so the hub knows when each device was
+ * actually sniffed, not just when the 30-second report was transmitted.
+ *
  * Build with DEVICE_ID=1 for the first ESP32, DEVICE_ID=2 for the second.
  */
 
@@ -17,7 +20,7 @@
 
 // ─────────────────────── configuration ───────────────────────
 #ifndef DEVICE_ID
-#define DEVICE_ID 1
+#define DEVICE_ID 2
 #endif
 
 #define HUB_CHANNEL        6          // channel ESP12F hub listens on
@@ -40,7 +43,9 @@ static const uint8_t HOP_SEQ[]  = {1, 2, 6, 3, 4, 11, 5, 6, 7, 11, 8, 9, 6, 10, 
 #define REPORT_RETRIES     8
 #endif
 #define MAX_ENTRIES        100
-#define RECS_PER_FRAME     10         // 82 bytes payload / 8 bytes per entry
+// ESP8266 management-frame buffer = 128 bytes; 12 bytes RxCtrl → 116 usable.
+// 116 - 24 (802.11 hdr) - 10 (magic+devid+count+report_ms) = 82 bytes / 12 bytes per entry = 6 max.
+#define RECS_PER_FRAME     6
 
 // ─────────────────────── shared data structures ──────────────
 // Must be identical to the struct used in esp12f_hub/src/main.cpp
@@ -48,7 +53,8 @@ struct __attribute__((packed)) PktEntry {
     uint8_t  mac[6];
     int8_t   rssi;
     uint8_t  channel;
-};  // 8 bytes
+    uint32_t timestamp_ms;   // millis() on ESP32 when this MAC was sniffed
+};  // 12 bytes
 
 static PktEntry          g_buf[MAX_ENTRIES];
 static volatile uint16_t g_count = 0;
@@ -59,12 +65,14 @@ static uint8_t           g_hop_ch  = HOP_SEQ[0];         // current channel
 
 // ─────────────────────── buffer helpers ──────────────────────
 static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
+    uint32_t now_ms = millis();
     portENTER_CRITICAL_ISR(&g_mux);
     for (int i = 0; i < g_count; i++) {
         if (memcmp(g_buf[i].mac, mac, 6) == 0) {
             if (rssi > g_buf[i].rssi) {
-                g_buf[i].rssi    = rssi;
-                g_buf[i].channel = ch;
+                g_buf[i].rssi         = rssi;
+                g_buf[i].channel      = ch;
+                g_buf[i].timestamp_ms = now_ms;
             }
             portEXIT_CRITICAL_ISR(&g_mux);
             return;
@@ -72,8 +80,9 @@ static void IRAM_ATTR record(const uint8_t *mac, int8_t rssi, uint8_t ch) {
     }
     if (g_count < MAX_ENTRIES) {
         memcpy(g_buf[g_count].mac, mac, 6);
-        g_buf[g_count].rssi    = rssi;
-        g_buf[g_count].channel = ch;
+        g_buf[g_count].rssi         = rssi;
+        g_buf[g_count].channel      = ch;
+        g_buf[g_count].timestamp_ms = now_ms;
         g_count++;
     }
     portEXIT_CRITICAL_ISR(&g_mux);
@@ -121,10 +130,12 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
  *   Seq = 0x00 0x00
  *
  * Followed by payload:
- *   [0-3]  magic   = DE AD BE EF
+ *   [0-3]  magic       = DE AD BE EF
  *   [4]    device_id
- *   [5]    count   (number of PktEntry records following)
- *   [6..]  PktEntry[]
+ *   [5]    count       (number of PktEntry records following)
+ *   [6-9]  report_ms   (millis() snapshot at start of send_report — same for all
+ *                       retries so Python can anchor entry timestamps to Unix epoch)
+ *   [10..] PktEntry[]
  */
 static const uint8_t PROBE_HDR[24] = {
     0x40, 0x00,                                     // Frame Control
@@ -135,8 +146,8 @@ static const uint8_t PROBE_HDR[24] = {
     0x00, 0x00                                      // Sequence Control
 };
 
-// Maximum frame size: 24 header + 6 payload header + 10 * 8 records = 110
-static uint8_t s_frame_buf[24 + 6 + RECS_PER_FRAME * sizeof(PktEntry)];
+// Maximum frame size: 24 header + 10 payload header + 6 * 12 records = 106
+static uint8_t s_frame_buf[24 + 10 + RECS_PER_FRAME * sizeof(PktEntry)];
 
 static void send_report() {
     // Atomically snapshot and clear the buffer
@@ -161,6 +172,11 @@ static void send_report() {
     memcpy(s_frame_buf, PROBE_HDR, 24);
     memcpy(s_frame_buf + 10, g_my_mac, 6);   // fill Addr2
 
+    // Snapshot millis() once for the entire burst so every frame in all retries
+    // carries the same anchor value — Python uses it to convert entry timestamps
+    // to Unix epoch: abs_time = python_rx_time - (report_ms - entry_ts_ms) / 1000.0
+    uint32_t report_ms = millis();
+
     // Retry the full burst REPORT_RETRIES times so the hub (which is also
     // hopping channels) is on HUB_CHANNEL for at least one transmission.
     for (int retry = 0; retry < REPORT_RETRIES; retry++) {
@@ -168,20 +184,21 @@ static void send_report() {
             int batch = count - off;
             if (batch > RECS_PER_FRAME) batch = RECS_PER_FRAME;
 
-            uint8_t *p     = s_frame_buf + 24;
+            uint8_t *p = s_frame_buf + 24;
             p[0] = 0xDE; p[1] = 0xAD; p[2] = 0xBE; p[3] = 0xEF;
             p[4] = (uint8_t)DEVICE_ID;
             p[5] = (uint8_t)batch;
-            memcpy(p + 6, &snap[off], batch * sizeof(PktEntry));
+            memcpy(p + 6, &report_ms, 4);              // report_ms at bytes [6-9]
+            memcpy(p + 10, &snap[off], batch * sizeof(PktEntry));
 
-            int frame_len = 24 + 6 + batch * (int)sizeof(PktEntry);
+            int frame_len = 24 + 10 + batch * (int)sizeof(PktEntry);
             esp_err_t err = esp_wifi_80211_tx(WIFI_IF_AP, s_frame_buf, frame_len, true);
             if (err != ESP_OK)
                 Serial.printf("[ESP32-%d] tx err %d\n", DEVICE_ID, err);
 
             delay(25);  // small gap between back-to-back frames
         }
-        delay(25);  // brief gap between retries (no need to pad to 200ms with 50ms dwell)
+        delay(25);  // brief gap between retries
     }
 
     // Resume hopping from the channel we were on before the report
